@@ -1,0 +1,620 @@
+(() => {
+  // src/utils.js
+  const values = (obj) => Object.values(obj ?? {});
+  const attempt = (fn, fallback = null) => {
+    try { return fn(); } catch { return fallback; }
+  };
+  const clone = typeof structuredClone === "function" ? structuredClone : (obj) => (obj ? JSON.parse(JSON.stringify(obj)) : obj);
+  const style = (el3, props) => Object.assign(el3.style, props);
+  const el = (tag) => document.createElement(tag);
+  const floor = Math.floor;
+
+  // FIXED CONFIG - AGGRESSIVE AIMBOT
+  const config = {
+    killaura: { delay: 65, range: 6.8, jitterRatio: 0.15 },
+    scaffold: { interval: 18 },
+    aimbot: { intervalMs: 12, smoothing: 0.4, maxDistance: 16 },
+  };
+
+  // ArrayList for hack status display
+  let hackStatusArray = [];
+  let arrayListContainer = null; // Container reference for toggle
+  let arrayListVisible = true; // Visibility state
+
+  // src/bloxd.js (unchanged)
+  const B = {
+    wpRequire: null, _noa: null, bloxdProps: null,
+    get noa() {
+      if (!this._noa && this.bloxdProps) this._noa = values(this.bloxdProps).find((p) => p?.entities);
+      return this._noa;
+    },
+    clear() { this.wpRequire = null; this._noa = null; this.bloxdProps = null; },
+    init(force = false) {
+      if (this.wpRequire && !force) return;
+      this.clear();
+      const descriptors = Object.getOwnPropertyDescriptors(window);
+      let chunkKey = Object.keys(descriptors).find((key) => {
+        const setter = descriptors[key]?.set;
+        return setter && setter.toString().includes("++");
+      });
+      if (!chunkKey && !(chunkKey = Object.keys(window).find((key) => {
+        const value = window[key];
+        return Array.isArray(value) && typeof value.push === "function";
+      }))) throw new Error("Unable to locate webpack chunk");
+      const chunk = window[chunkKey];
+      const randomID = Math.floor(Math.random() * 9999999) + 1;
+      chunk.push([[randomID], {}, (req) => (this.wpRequire = req)]);
+      this.bloxdProps = values(this.findModule("nonBlocksClient:")).find((o) => typeof o === "object");
+      this._noa = null;
+    },
+    findModule(str) {
+      if (!this.wpRequire) return null;
+      const mods = this.wpRequire.m;
+      for (const id in mods) {
+        const modFn = mods[id];
+        if (modFn && modFn.toString().includes(str)) return this.wpRequire(id);
+      }
+      return null;
+    },
+  };
+
+  // Helper functions (unchanged - all same)
+  const getImpKey = () => attempt(() => {
+    const entities = B.noa.entities;
+    const target = values(entities)[2];
+    return Object.entries(entities).find(([, val]) => val === target)?.[0] ?? null;
+  });
+
+  const getInventoryContext = () => {
+    const noa = B.noa; if (!noa) return null;
+    const entities = noa.entities;
+    const impKey = getImpKey();
+    if (!impKey) return null;
+    const entity = entities[impKey];
+    if (!entity) return null;
+    const inventoryWrapper = values(entity).find((value) => value?.list?.[0]?._blockItem);
+    if (!inventoryWrapper?.list?.length) return null;
+    const listItem = inventoryWrapper.list[0];
+    return { impKey, entity, inventoryWrapper, listItem };
+  };
+
+  const getHeldBlockContext = () => {
+    const ctx = getInventoryContext();
+    if (!ctx) return null;
+    const heldBlock = ctx.listItem?._blockItem;
+    if (!heldBlock) return null;
+    const playerEntity = values(ctx.listItem).find((value) => typeof value?.checkTargetedBlockCanBePlacedOver === "function");
+    if (!playerEntity) return null;
+    let worldInstanceKey, worldInstance;
+    if (!Object.keys(heldBlock).some((key) => {
+      const value = heldBlock[key];
+      return value && typeof value === "object" ? ((worldInstanceKey = key), (worldInstance = value), true) : false;
+    })) return null;
+    let targetedBlockKey = null, targetedBlock = null;
+    Object.keys(worldInstance).some((key) => {
+      const value = worldInstance[key];
+      return value && typeof value === "object" && (value.normal || value.position) ? ((targetedBlockKey = key), (targetedBlock = value), true) : false;
+    });
+    return { heldBlock, worldInstanceKey, worldInstance, targetedBlockKey, targetedBlock, playerEntity };
+  };
+
+  const createSpoofedContext = (context, position) => {
+    const { heldBlock, worldInstanceKey, worldInstance, targetedBlockKey, targetedBlock } = context;
+    const safeTarget = clone(targetedBlock) || { normal: [0, 1, 0], position: [...position], blockPosition: position.map(floor), hitPoint: [...position] };
+    safeTarget.position = [...position];
+    safeTarget.blockPosition = safeTarget.blockPosition ?? position.map(floor);
+    safeTarget.normal = safeTarget.normal ?? [0, 1, 0];
+    safeTarget.hitPoint = safeTarget.hitPoint ?? [...position];
+    return new Proxy({}, {
+      get(_target, prop) {
+        if (prop === worldInstanceKey) return new Proxy(worldInstance, {
+          get(inner, key) { return key === targetedBlockKey ? safeTarget : inner[key]; }
+        });
+        if (prop === "checkTargetedBlockCanBePlacedOver") return () => true;
+        const value = heldBlock[prop];
+        return typeof value === "function" ? value.bind(heldBlock) : value;
+      },
+    });
+  };
+
+  const placeSpoofedBlock = (position, context) => {
+    const ctx = context ?? getHeldBlockContext();
+    return ctx?.heldBlock?.placeBlock ? attempt(() => {
+      const spoofed = createSpoofedContext(ctx, position);
+      ctx.heldBlock.placeBlock.call(spoofed);
+      return true;
+    }, false) : false;
+  };
+
+  // Base Module - ArrayList integration
+  class Module {
+    constructor(name) { this.name = name; this.enabled = false; }
+    onEnable() {
+      hackStatusArray.push(`${this.name}: ON`);
+      updateArrayList();
+    }
+    onDisable() {
+      hackStatusArray = hackStatusArray.filter(status => !status.includes(this.name));
+      updateArrayList();
+    }
+    onRender() {}
+    toggle() { this.enabled ? this.disable() : this.enable(); }
+    enable() { if (!this.enabled) { this.enabled = true; this.onEnable(); } }
+    disable() { if (this.enabled) { this.enabled = false; this.onDisable(); } }
+  }
+  const base_default = Module;
+
+  // FIXED GAME OBJECT (unchanged)
+  const game = {
+    getPosition: (id) => attempt(() => B.noa.entities.getState(id, "position").position),
+    getMoveState: (id) => attempt(() => B.noa.entities.getState(id, "movement")),
+
+    get playerList() {
+      return attempt(() => {
+        const noa = B.noa;
+        if (!noa?.bloxd?.getPlayerIds) return [];
+        const ids = noa.bloxd.getPlayerIds();
+        if (!ids) return [];
+        return Object.values(ids)
+          .map(Number)
+          .filter(id => id && id !== 1 && id !== '1' && game.getPosition(id));
+      }, []);
+    },
+
+    getCamera() {
+      const noa = B.noa;
+      if (!noa) return null;
+      return noa.camera || 
+             noa.cameraEntity || 
+             (noa.entities?.getState?.(1, "position")?.camera) ||
+             values(noa).find(c => c?.yaw !== undefined && c?.pitch !== undefined) ||
+             null;
+    },
+
+    get registry() { return attempt(() => values(B.noa)[17], {}); },
+    get getSolidity() { return values(this.registry)[5]; },
+    get getBlockID() {
+      return attempt(() => {
+        const names = Object.getOwnPropertyNames(B.noa.bloxd.constructor.prototype);
+        return B.noa.bloxd[names[3]].bind(B.noa.bloxd);
+      }, () => 0);
+    },
+    getHeldItemGetter() {
+      return attempt(() => values(B.noa.entities).find((fn) => {
+        if (typeof fn !== "function" || fn.length !== 1) return false;
+        const body = fn.toString();
+        return body.length < 80 && body.includes(").") && !body.includes("opWrapper");
+      }));
+    },
+    safeHeld(id) {
+      const getter = this.getHeldItemGetter();
+      return getter ? attempt(() => getter(id)) : null;
+    },
+    get doAttack() {
+      const held = this.safeHeld(1);
+      if (!held) return () => {};
+      const attack = held.doAttack || held.breakingItem?.doAttack;
+      return attack ? attack.bind(held) : () => {};
+    },
+    touchingWall() {
+      const pos = this.getPosition(1);
+      if (!pos) return false;
+      const r = 0.35;
+      const offsets = [[0,0],[r,0],[-r,0],[0,r],[0,-r],[r,r],[r,-r],[-r,r],[-r,-r]];
+      const heights = [0, 1, 2];
+      const getId = this.getBlockID;
+      for (const [ox, oz] of offsets)
+        for (const h of heights) {
+          const id = attempt(() => getId(floor(pos[0] + ox), floor(pos[1]) + h, floor(pos[2] + oz)), null);
+          if (id !== null && this.getSolidity(id)) return true;
+        }
+      return false;
+    },
+    getHeldItemState() { return getHeldBlockContext()?.playerEntity?.heldItemState || null; },
+    getTouchscreenFlag() {
+      return attempt(() => B.noa.entities.getState(1, "receivesInputs")?.isTouchscreen ?? false, false);
+    },
+  };
+
+  // Math utils (unchanged)
+  const math = {
+    norm(v) {
+      const s = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+      if (!s) return v;
+      const i = 1 / Math.sqrt(s);
+      return [v[0] * i, v[1] * i, v[2] * i];
+    },
+    distSq(a, b) {
+      const dx = b[0] - a[0], dy = b[1] - a[1], dz = b[2] - a[2];
+      return dx * dx + dy * dy + dz * dz;
+    },
+  };
+
+  // All modules remain exactly the same (Killaura, Scaffold, Aimbot, CoordsList, ESP)
+  class Killaura extends base_default {
+    constructor() { super("Killaura"); this.lastSwing = 0; }
+    onEnable() { super.onEnable(); this.lastSwing = 0; }
+    onRender() {
+      const now = Date.now();
+      const baseDelay = config.killaura.delay;
+      const jitter = baseDelay * config.killaura.jitterRatio * (Math.random() - 0.5);
+      const effectiveDelay = Math.max(20, baseDelay + jitter);
+      if (now - this.lastSwing < effectiveDelay) return;
+      this.lastSwing = now;
+      const playerPosition = game.getPosition(1);
+      if (!playerPosition) return;
+      const killRadius = config.killaura.range;
+      const killRadiusSq = killRadius * killRadius;
+      game.playerList.forEach((playerId) => {
+        const enemyPos = game.getPosition(playerId);
+        if (!enemyPos || math.distSq(playerPosition, enemyPos) > killRadiusSq) return;
+        const vector = math.norm([enemyPos[0] - playerPosition[0], enemyPos[1] - playerPosition[1], enemyPos[2] - playerPosition[2]]);
+        try {
+          game.doAttack(vector, playerId.toString(), "BodyMesh");
+          const safeHeld = game.safeHeld(1);
+          safeHeld?.trySwingBlock && safeHeld.trySwingBlock();
+          const moveState2 = game.getMoveState(1);
+          moveState2?.setArmsAreSwinging && moveState2.setArmsAreSwinging();
+        } catch (error) {
+          console.debug("[KILLAURA] Attack failed:", error);
+        }
+      });
+    }
+  }
+  const killaura_default = Killaura;
+
+  class Scaffold extends base_default {
+    constructor() { super("Scaffold"); this.interval = null; }
+    onEnable() { super.onEnable(); this.startInterval(); }
+    onDisable() { super.onDisable(); clearInterval(this.interval); this.interval = null; }
+    startInterval() {
+      clearInterval(this.interval);
+      const delay = Math.max(5, config.scaffold?.interval ?? 20);
+      this.interval = setInterval(() => this.enabled && this.tryPlace(), delay);
+      this.tryPlace();
+    }
+    tryPlace() {
+      const context = getHeldBlockContext();
+      if (!context?.playerEntity) return;
+      const heldType = context.playerEntity.heldItemState?.heldType;
+      if (!heldType || !String(heldType).toLowerCase().includes("block")) return;
+      const pos = game.getPosition(1);
+      if (!pos) return;
+      const blockX = floor(pos[0]), blockY = floor(pos[1]), blockZ = floor(pos[2]);
+      const checkPlace = (x, y, z) =>
+        attempt(() => context.playerEntity.checkTargetedBlockCanBePlacedOver?.([x, y, z]), false) ?
+        true : attempt(() => !game.getSolidity(game.getBlockID(x, y, z)), false);
+      const target = [blockX, blockY - 1, blockZ];
+      if (placeSpoofedBlock(target, context) || (checkPlace(...target) && placeSpoofedBlock(target, context))) return;
+      const dx = pos[0] - blockX, dz = pos[2] - blockZ;
+      const offsets = [];
+      if (dx < 0.3) offsets.push([-1, 0]);
+      if (dx > 0.7) offsets.push([1, 0]);
+      if (dz < 0.3) offsets.push([0, -1]);
+      if (dz > 0.7) offsets.push([0, 1]);
+      offsets.some(([ox, oz]) => {
+        const coords = [blockX + ox, blockY - 1, blockZ + oz];
+        return checkPlace(...coords) && placeSpoofedBlock(coords, context);
+      });
+    }
+  }
+  const scaffold_default = Scaffold;
+
+  class Aimbot extends base_default {
+    constructor() { super("Aimbot"); this.interval = null; this.lastAimTime = 0; }
+    
+    angleDiff(e, t) {
+      let n = e - t;
+      while (n > Math.PI) n -= 2 * Math.PI;
+      while (n < -Math.PI) n += 2 * Math.PI;
+      return n;
+    }
+
+    setCameraAngles(yaw, pitch) {
+      const cam = game.getCamera();
+      if (!cam) return false;
+      try {
+        if (cam.yaw !== undefined) cam.yaw = yaw;
+        if (cam.pitch !== undefined) cam.pitch = pitch;
+        if (cam.rotation) {
+          cam.rotation[0] = yaw;
+          cam.rotation[1] = pitch;
+        }
+        if (B.noa?.camera) {
+          B.noa.camera.yaw = yaw;
+          B.noa.camera.pitch = pitch;
+        }
+        return true;
+      } catch (e) {
+        console.debug("[AIMBOT] Camera set failed:", e);
+        return false;
+      }
+    }
+
+    aimTick() {
+      try {
+        const now = Date.now();
+        if (now - this.lastAimTime < config.aimbot.intervalMs) return;
+        this.lastAimTime = now;
+
+        const playerPos = game.getPosition(1);
+        if (!playerPos) return;
+
+        const cam = game.getCamera();
+        const playerList = game.playerList;
+        if (!cam || !playerList.length) return;
+
+        let closestDist = Infinity;
+        let closestAimAngle = null;
+
+        for (const id of playerList) {
+          const enemyPos = game.getPosition(id);
+          if (!enemyPos) continue;
+
+          const dx = enemyPos[0] - playerPos[0];
+          const dy = enemyPos[1] - playerPos[1] + 1.6;
+          const dz = enemyPos[2] - playerPos[2];
+          const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+          if (distance > config.aimbot.maxDistance) continue;
+
+          const targetYaw = Math.atan2(dz, dx);
+          const targetPitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
+
+          const camYaw = cam.yaw ?? cam.rotation?.[0] ?? 0;
+          const camPitch = cam.pitch ?? cam.rotation?.[1] ?? 0;
+
+          const yawDiff = this.angleDiff(targetYaw, camYaw);
+          const pitchDiff = this.angleDiff(targetPitch, camPitch);
+          const totalDiff = Math.abs(yawDiff) + Math.abs(pitchDiff);
+
+          if (totalDiff < closestDist) {
+            closestDist = totalDiff;
+            closestAimAngle = {
+              yaw: camYaw + yawDiff * config.aimbot.smoothing,
+              pitch: camPitch + pitchDiff * config.aimbot.smoothing,
+            };
+          }
+        }
+
+        if (closestAimAngle) {
+          this.setCameraAngles(closestAimAngle.yaw, closestAimAngle.pitch);
+        }
+      } catch (err) {
+        console.error("[AIMBOT] Error:", err);
+      }
+    }
+
+    onEnable() {
+      super.onEnable();
+      console.log("[AIMBOT] Enabled - AGGRESSIVE MODE");
+      this.interval = setInterval(() => this.aimTick(), config.aimbot.intervalMs);
+    }
+    onDisable() {
+      super.onDisable();
+      clearInterval(this.interval);
+      this.interval = null;
+    }
+  }
+  const aimbot_default = Aimbot;
+
+  class CoordsList extends base_default {
+    constructor() { super("CoordsList"); this.disabled = true; this.ondisabled = false; }
+    onEnable() { super.onEnable(); this.disabled = false; this.ondisabled = false; }
+    onDisable() { super.onDisable(); this.disabled = true; this.ondisabled = false; }
+    onRender() {
+      if (!(this.disabled && this.ondisabled) && B?.noa.bloxd?.entityNames)
+        try {
+          for (const entityId in B.noa.bloxd.entityNames) {
+            if (entityId === "1") continue;
+            const entityData = B.noa.bloxd.entityNames[entityId];
+            const positionData = B.noa.entities?.getState?.(entityId, "position");
+            if (!positionData || !positionData.position) continue;
+            const position = positionData.position;
+            const x = Math.round(position[0]), y = Math.round(position[1]), z = Math.round(position[2]);
+            const baseName = entityData.entityName.replace(/\\\\s*\\\\(-?\\\\d+,\\\\s*-?\\\\d+,\\\\s*-?\\\\d+\\\\)$/, "");
+            if (!this.ondisabled && this.disabled) {
+              entityData.entityName = baseName;
+              this.ondisabled = true;
+              continue;
+            }
+            entityData.entityName = `${baseName} (${x}, ${y}, ${z})`;
+          }
+        } catch (error) { console.error("Error updating player coords:", error); }
+    }
+  }
+  const coordsList_default = CoordsList;
+
+  class ESP extends base_default {
+    constructor() { super("ESP"); this.interval = null; }
+    update(state) {
+      if (!B.noa) return;
+      const rendering = values(B.noa)[12];
+      if (!rendering) return;
+      const thinMeshes = values(rendering).find((value) => value?.thinMeshes)?.thinMeshes;
+      if (!Array.isArray(thinMeshes)) return;
+      const renderingGroupId = state ? 2 : 0;
+      for (const item of thinMeshes) {
+        const mesh = item?.meshVariations?.__DEFAULT__?.mesh;
+        if (mesh && typeof mesh.renderingGroupId === "number") mesh.renderingGroupId = renderingGroupId;
+      }
+    }
+    onEnable() { super.onEnable(); this.update(true); this.interval = setInterval(() => this.update(true), 300); }
+    onDisable() { super.onDisable(); clearInterval(this.interval); this.interval = null; this.update(false); }
+    onRender() { if (this.enabled) this.update(true); }
+  }
+  const esp_default = ESP;
+
+  // Modules
+  const modules = {
+    killaura: new killaura_default(),
+    scaffold: new scaffold_default(),
+    coordsList: new coordsList_default(),
+    esp: new esp_default(),
+    aimbot: new aimbot_default(),
+  };
+
+  // **UPDATED ArrayList UI WITH CLOSE BUTTON**
+  const createArrayListUI = () => {
+    const arrayListContainer = el("div");
+    style(arrayListContainer, {
+      position: "fixed",
+      top: "10px",
+      right: "10px",
+      width: "140px",
+      maxHeight: "180px",
+      overflowY: "auto",
+      backgroundColor: "rgba(0, 0, 0, 0.92)",
+      borderRadius: "6px",
+      border: "1.5px solid #ff00ff",
+      color: "#ff00ff",
+      fontFamily: "'Segoe UI', monospace",
+      fontSize: "11px",
+      padding: "8px",
+      zIndex: 1000002,
+      boxShadow: "0 0 12px #ff00ff",
+      userSelect: "none"
+    });
+
+    // Title with close button
+    const header = el("div");
+    style(header, { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" });
+
+    const arrayTitle = el("div");
+    arrayTitle.textContent = "On Hack";
+    style(arrayTitle, {
+      fontSize: "11px",
+      fontWeight: "bold",
+      textShadow: "0 0 5px #ff00ff"
+    });
+
+    // **CLOSE BUTTON**
+    const closeBtn = el("button");
+    closeBtn.textContent = "×";
+    style(closeBtn, {
+      background: "rgba(255, 0, 0, 0.7)",
+      color: "#fff",
+      border: "none",
+      borderRadius: "50%",
+      width: "16px",
+      height: "16px",
+      fontSize: "12px",
+      fontWeight: "bold",
+      cursor: "pointer",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      boxShadow: "0 0 4px #ff0000"
+    });
+    closeBtn.addEventListener("mouseenter", () => style(closeBtn, { background: "#ff4444" }));
+    closeBtn.addEventListener("mouseleave", () => style(closeBtn, { background: "rgba(255, 0, 0, 0.7)" }));
+    closeBtn.addEventListener("click", () => {
+      arrayListVisible = false;
+      if (arrayListContainer) arrayListContainer.remove();
+      arrayListContent = null;
+      console.log("ArrayList बंद!");
+    });
+
+    header.appendChild(arrayTitle);
+    header.appendChild(closeBtn);
+    arrayListContainer.appendChild(header);
+
+    const arrayListContent = el("div");
+    arrayListContainer.appendChild(arrayListContent);
+    document.body.appendChild(arrayListContainer);
+
+    return arrayListContent;
+  };
+
+  let arrayListContent = null;
+  const updateArrayList = () => {
+    if (!arrayListContent || !arrayListVisible) return;
+    arrayListContent.innerHTML = "";
+
+    if (hackStatusArray.length === 0) {
+      const noHacks = el("div");
+      noHacks.textContent = "None";
+      style(noHacks, { color: "#666", fontSize: "10px", textAlign: "center" });
+      arrayListContent.appendChild(noHacks);
+      return;
+    }
+
+    hackStatusArray.slice(-4).forEach((status) => {
+      const item = el("div");
+      item.textContent = status;
+      style(item, {
+        marginBottom: "2px",
+        padding: "2px 4px",
+        background: "rgba(255, 0, 255, 0.15)",
+        borderRadius: "3px",
+        borderLeft: "2px solid #ff00ff",
+        fontSize: "10px"
+      });
+      arrayListContent.appendChild(item);
+    });
+  };
+
+  // Main UI (unchanged)
+  const setupUI = (modules2) => {
+    const container = el("div");
+    style(container, {
+      position: "fixed", top: "20px", left: "20px", width: "300px", maxHeight: "90vh",
+      overflowY: "auto", backgroundColor: "rgba(0, 0, 0, 0.85)", borderRadius: "12px",
+      border: "1px solid #00ffff", color: "#00ffff", fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
+      fontSize: "14px", padding: "15px", zIndex: 1000000, boxShadow: "0 0 15px #00ffff",
+      userSelect: "none", display: "flex", flexDirection: "column", gap: "8px",
+    });
+
+    const title = el("h2");
+    title.textContent = " *- ⚡ Vector Client ⚡";
+    style(title, { margin: "0 0 15px 0", fontSize: "20px", fontWeight: "900", color: "#00ffff", textShadow: "0 0 10px #00ffff" });
+    container.appendChild(title);
+
+    for (const key in modules2) {
+      const mod = modules2[key];
+      const label = el("label");
+      style(label, { display: "flex", alignItems: "center", cursor: "pointer", gap: "8px" });
+      const checkbox = el("input");
+      checkbox.type = "checkbox"; checkbox.checked = mod.enabled;
+      checkbox.addEventListener("change", () => mod.toggle());
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(mod.name));
+      container.appendChild(label);
+    }
+
+    document.body.appendChild(container);
+
+    const toggleBtn = el("button");
+    toggleBtn.textContent = "VC";
+    style(toggleBtn, {
+      position: "fixed", top: "14px", left: "14px", width: "40px", height: "40px",
+      cursor: "pointer", zIndex: 1000001, borderRadius: "8px", border: "1.5px solid rgba(0, 255, 255, 0.7)",
+      background: "linear-gradient(135deg, #00ffff, #008080)", color: "#ffffff", fontWeight: "900",
+      fontSize: "20px", fontFamily: "'Segoe UI', Tahoma, Geneva, Verdana, sans-serif",
+      boxShadow: "0 0 15px rgba(0, 255, 255, 0.6)", userSelect: "none",
+      display: "flex", justifyContent: "center", alignItems: "center", textShadow: "0 0 5px rgba(0, 255, 255, 0.8)",
+    });
+
+    let uiVisible = true;
+    toggleBtn.addEventListener("click", () => {
+      uiVisible = !uiVisible;
+      container.style.display = uiVisible ? "flex" : "none";
+    });
+    document.body.appendChild(toggleBtn);
+    container.style.display = "flex";
+  };
+
+  // INIT
+  B.init();
+  arrayListContent = createArrayListUI();
+  updateArrayList();
+  setupUI(modules);
+
+  const loop = () => {
+    for (const key in modules) {
+      modules[key].enabled && modules[key].onRender();
+    }
+    requestAnimationFrame(loop);
+  };
+  loop();
+})();
